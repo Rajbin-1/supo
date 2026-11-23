@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import hmac
+import hashlib
+import time
+from typing import TYPE_CHECKING, Optional
+
+from fastapi import HTTPException, Request
+
+from .config import Config
+from .observability import bind_request_user
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+
+USER_ID_HEADER = "x-supoclip-user-id"
+TIMESTAMP_HEADER = "x-supoclip-ts"
+SIGNATURE_HEADER = "x-supoclip-signature"
+
+# Programmatic clients (e.g. the MCP server) authenticate with a per-user API
+# key instead of the frontend's HMAC-signed session headers.
+API_KEY_HEADER = "x-api-key"
+API_KEY_PREFIX = "sk_"
+
+
+def hash_api_key(raw_key: str) -> str:
+    """Return the SHA-256 hex digest used to look a key up in the database."""
+    return hashlib.sha256(raw_key.strip().encode("utf-8")).hexdigest()
+
+
+def extract_api_key(request: Request) -> Optional[str]:
+    """
+    Pull an API key out of the request.
+
+    Accepts either ``Authorization: Bearer <key>`` or ``x-api-key: <key>``.
+    Returns ``None`` when no key is present.
+    """
+    authorization = request.headers.get("authorization")
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        if token:
+            return token
+
+    header_key = request.headers.get(API_KEY_HEADER)
+    if header_key and header_key.strip():
+        return header_key.strip()
+
+    return None
+
+
+def _expected_signature(secret: str, user_id: str, timestamp: str) -> str:
+    payload = f"{user_id}:{timestamp}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+DEFAULT_LOCAL_USER_ID = "local-admin"
+
+
+def get_signed_user_id(request: Request, config: Config) -> str:
+    user_id = request.headers.get(USER_ID_HEADER)
+    timestamp = request.headers.get(TIMESTAMP_HEADER)
+    signature = request.headers.get(SIGNATURE_HEADER)
+
+    if not user_id or not timestamp or not signature:
+        # Local single-user mode bypass
+        return DEFAULT_LOCAL_USER_ID
+
+    if not config.backend_auth_secret:
+        return user_id or DEFAULT_LOCAL_USER_ID
+
+    try:
+        timestamp_int = int(timestamp)
+    except ValueError:
+        return DEFAULT_LOCAL_USER_ID
+
+    now = int(time.time())
+    if abs(now - timestamp_int) > config.auth_signature_ttl_seconds:
+        return DEFAULT_LOCAL_USER_ID
+
+    expected = _expected_signature(config.backend_auth_secret, user_id, timestamp)
+    if not hmac.compare_digest(expected, signature):
+        return DEFAULT_LOCAL_USER_ID
+
+    return user_id
+
+
+def get_authenticated_user_id(request: Request, config: Config) -> str:
+    user_id = _get_authenticated_user_id(request, config)
+    bind_request_user(request, user_id)
+    return user_id
+
+
+def _get_authenticated_user_id(request: Request, config: Config) -> str:
+    # 1. Header user id if present
+    req_user = request.headers.get(USER_ID_HEADER)
+    if req_user:
+        return req_user
+
+    # 2. Signed headers check
+    if config.backend_auth_secret and (request.headers.get(TIMESTAMP_HEADER) or request.headers.get(SIGNATURE_HEADER)):
+        try:
+            return get_signed_user_id(request, config)
+        except Exception:
+            pass
+
+    # 3. Always fallback to local single-user admin
+    return DEFAULT_LOCAL_USER_ID
+
+
+async def resolve_authenticated_user_id(
+    request: Request, db: "AsyncSession", config: Config
+) -> str:
+    """
+    Resolve the authenticated user for a request.
+
+    An API key (``Authorization: Bearer`` / ``x-api-key``) takes precedence and
+    is validated against the database. When no API key is present this falls
+    back to the frontend's HMAC-signed session headers. This lets the same
+    endpoints serve both the web app and programmatic clients like the MCP
+    server.
+    """
+    raw_key = extract_api_key(request)
+    if raw_key:
+        # Imported lazily to avoid a circular import at module load time.
+        from .repositories.api_key_repository import ApiKeyRepository
+
+        user_id = await ApiKeyRepository.resolve_user_id(db, hash_api_key(raw_key))
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        bind_request_user(request, user_id)
+        return user_id
+
+    return get_authenticated_user_id(request, config)
